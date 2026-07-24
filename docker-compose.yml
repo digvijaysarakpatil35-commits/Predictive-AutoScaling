@@ -1,0 +1,18 @@
+
+# Dummy workload standing in for the service being autoscaled.
+#
+# The engine runs on the host (./mvnw spring-boot:run). When
+# autoscale.docker.enabled=true it shells out to
+#   docker compose up -d --no-recreate --scale workload=<N>
+# to drive the real replica count from the chosen strategy's decisions.
+#
+# Real scaling is entirely optional: the three-way comparison runs in shadow
+# mode with no containers at all. This file exists so the "predictive strategy
+# drives real infrastructure" story is demonstrable, not just simulated.
+services:
+  workload:
+    image: nginx:alpine
+    # No container_name and no published host ports, so `--scale workload=N`
+    # can start many replicas without name or port collisions.
+    expose:
+      - "80"

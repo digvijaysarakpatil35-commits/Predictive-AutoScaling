@@ -1,0 +1,30 @@
+# Closed-loop demo topology: a load balancer in front of CPU-limited workload
+# replicas. The engine (run with --autoscale.mode=closed-loop) fires real traffic
+# at the LB, reads real CPU back from the workload containers, and scales them.
+#
+#   docker compose -f docker-compose.closedloop.yml up --build -d
+#   docker compose -f docker-compose.closedloop.yml up -d --no-recreate --scale workload=N
+services:
+  workload:
+    build: ./workload
+    environment:
+      # per-request CPU work; calibrated so mid-load ~= the scaling target
+      WORK_ITERATIONS: "120"
+    expose:
+      - "8080"
+    # No container_name and no published ports, so `--scale workload=N` can run
+    # many replicas. Each replica is capped so it's a bounded unit of capacity —
+    # this is what makes adding replicas genuinely add throughput on one host.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  lb:
+    image: nginx:alpine
+    depends_on:
+      - workload
+    ports:
+      - "8090:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro

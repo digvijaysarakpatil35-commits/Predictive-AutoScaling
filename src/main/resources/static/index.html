@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Predictive Auto-Scaling — Live Dashboard</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --grid: #334155; --text: #e2e8f0; --muted: #94a3b8;
+    --actual: #22d3ee; --regression: #f59e0b; --smoothing: #94a3b8;
+    --baseline: #64748b; --reactive: #eab308; --predictive: #22c55e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+           padding: 14px 20px; border-bottom: 1px solid var(--grid); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .status { font-size: 12px; font-family: monospace; padding: 3px 8px; border-radius: 4px; }
+  .status.live { background: #14532d; color: #4ade80; }
+  .status.down { background: #4c1d24; color: #fca5a5; }
+  .status.mode { background: #1e3a5f; color: #93c5fd; }
+  .muted { color: var(--muted); font-size: 12px; }
+  main { padding: 16px 20px; display: grid; gap: 18px; max-width: 1100px; margin: 0 auto; }
+  .panel { background: var(--panel); border: 1px solid var(--grid); border-radius: 8px; padding: 14px 16px; }
+  .panel h2 { font-size: 13px; margin: 0 0 4px; font-weight: 600; }
+  .panel p.cap { margin: 0 0 10px; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; margin-bottom: 8px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+  .swatch.dash { background: repeating-linear-gradient(90deg, currentColor 0 5px, transparent 5px 9px); height: 3px; }
+  canvas { width: 100%; height: 240px; display: block; }
+  .stats { display: flex; gap: 24px; flex-wrap: wrap; font-family: monospace; font-size: 13px; }
+  .stats b { color: var(--text); font-weight: 600; }
+  button#restart { margin-left: auto; background: #334155; color: var(--text); border: 1px solid #475569;
+                   border-radius: 5px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  button#restart:hover { background: #475569; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Predictive Auto-Scaling — Live</h1>
+  <span id="status" class="status down">connecting…</span>
+  <span id="modeBadge" class="status" hidden></span>
+  <span class="muted">interval <b id="count">0</b> / 180</span>
+  <span class="muted">load <b id="load">–</b></span>
+  <span class="muted" id="cpuStat" hidden>cpu <b id="cpu">–</b>%</span>
+  <span class="muted" id="latStat" hidden>p95 <b id="p95">–</b> ms</span>
+  <button id="restart">Restart run</button>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Predicted vs. actual load</h2>
+    <p class="cap muted">Each forecast is drawn at the moment it was predicting <em>for</em>, so you can read it against the actual value that arrived. Regression tracks the recurring peaks; smoothing lags.</p>
+    <div class="legend">
+      <span style="color:var(--actual)"><i class="swatch" style="background:var(--actual)"></i>actual load</span>
+      <span style="color:var(--regression)"><i class="swatch dash"></i>linear regression</span>
+      <span style="color:var(--smoothing)"><i class="swatch dash"></i>exp. smoothing</span>
+    </div>
+    <canvas id="loadChart"></canvas>
+  </section>
+
+  <section class="panel">
+    <h2>Replicas per strategy</h2>
+    <p class="cap muted">Baseline never moves. Reactive follows load after the fact. Predictive (dots mark scaling actions) gets ahead of the recurring peaks once it has learned the cycle.</p>
+    <div class="legend">
+      <span data-strategy="BASELINE" style="color:var(--baseline)"><i class="swatch" style="background:var(--baseline)"></i>baseline</span>
+      <span data-strategy="REACTIVE" style="color:var(--reactive)"><i class="swatch" style="background:var(--reactive)"></i>reactive</span>
+      <span data-strategy="PREDICTIVE" style="color:var(--predictive)"><i class="swatch" style="background:var(--predictive)"></i>predictive</span>
+    </div>
+    <canvas id="replicaChart"></canvas>
+    <div class="stats" id="replicaStats"></div>
+  </section>
+</main>
+
+<script>
+const COLORS = getComputedStyle(document.documentElement);
+const c = n => COLORS.getPropertyValue(n).trim();
+const records = [];
+const tsIndex = new Map();
+
+function addRecord(r) {
+  const i = records.length;
+  records.push(r);
+  tsIndex.set(r.timestamp, i);
+}
+
+function predictionOf(record, method) {
+  return (record.predictions || []).find(p => p.method === method);
+}
+
+function seriesForForecast(method) {
+  const pts = [];
+  for (const r of records) {
+    const p = predictionOf(r, method);
+    if (!p) continue;
+    const target = tsIndex.get(p.forecastTimestamp);
+    if (target !== undefined) pts.push({ x: target, y: p.predictedLoad });
+  }
+  return pts;
+}
+
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const pow = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / pow;
+  const step = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+  return step * pow * 1.1;
+}
+
+function drawChart(canvas, cfg) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const padL = 44, padR = 12, padT = 10, padB = 24;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+  const xMax = Math.max(1, cfg.xMax), yMax = cfg.yMax;
+  const X = x => padL + (x / xMax) * plotW;
+  const Y = y => padT + plotH - (Math.min(y, yMax) / yMax) * plotH;
+
+  ctx.font = '11px monospace';
+  const ticks = 5;
+  for (let t = 0; t <= ticks; t++) {
+    const yv = yMax * t / ticks, py = Y(yv);
+    ctx.strokeStyle = c('--grid'); ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, py); ctx.lineTo(padL + plotW, py); ctx.stroke();
+    ctx.globalAlpha = 1; ctx.fillStyle = c('--muted');
+    ctx.fillText(Math.round(yv), 6, py + 4);
+  }
+  const xticks = 6;
+  for (let t = 0; t <= xticks; t++) {
+    const xv = Math.round(xMax * t / xticks);
+    ctx.fillStyle = c('--muted'); ctx.fillText(xv, X(xv) - 6, h - 7);
+  }
+
+  for (const s of cfg.series) {
+    if (!s.points.length) continue;
+    ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 2; ctx.setLineDash(s.dash || []);
+    ctx.beginPath();
+    s.points.forEach((p, i) => { const px = X(p.x), py = Y(p.y); i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); });
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  for (const m of (cfg.markers || [])) {
+    ctx.fillStyle = m.color; ctx.beginPath(); ctx.arc(X(m.x), Y(m.y), 3, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function replicaMarkers(strategy, color) {
+  const marks = [];
+  for (let i = 1; i < records.length; i++) {
+    const cur = records[i].replicas[strategy], prev = records[i - 1].replicas[strategy];
+    if (cur !== prev) marks.push({ x: i, y: cur, color });
+  }
+  return marks;
+}
+
+function render() {
+  const n = records.length;
+  document.getElementById('count').textContent = n;
+  if (!n) return;
+  const last = records[n - 1];
+  document.getElementById('load').textContent = last.actualLoad.toFixed(1);
+
+  // Measured CPU / latency appear only in closed-loop mode.
+  const cpuStat = document.getElementById('cpuStat');
+  const latStat = document.getElementById('latStat');
+  if (last.measuredCpuPercent != null) {
+    cpuStat.hidden = false; document.getElementById('cpu').textContent = last.measuredCpuPercent.toFixed(0);
+  }
+  if (last.measuredLatencyMs != null) {
+    latStat.hidden = false; document.getElementById('p95').textContent = last.measuredLatencyMs.toFixed(0);
+  }
+
+  const actual = records.map((r, i) => ({ x: i, y: r.actualLoad }));
+  const regression = seriesForForecast('LINEAR_REGRESSION');
+  const smoothing = seriesForForecast('EXP_SMOOTHING');
+  const loadMax = niceMax(Math.max(...actual.map(p => p.y), ...regression.map(p => p.y), 1));
+  drawChart(document.getElementById('loadChart'), {
+    xMax: Math.max(n - 1, 1), yMax: loadMax,
+    series: [
+      { points: smoothing, color: c('--smoothing'), width: 1.5, dash: [2, 3] },
+      { points: regression, color: c('--regression'), width: 2, dash: [6, 4] },
+      { points: actual, color: c('--actual'), width: 2 },
+    ],
+  });
+
+  const strategies = [['BASELINE', '--baseline'], ['REACTIVE', '--reactive'], ['PREDICTIVE', '--predictive']];
+  const repMax = niceMax(Math.max(...records.flatMap(r => Object.values(r.replicas)), 1));
+  drawChart(document.getElementById('replicaChart'), {
+    xMax: Math.max(n - 1, 1), yMax: repMax,
+    // flatMap skips strategies absent from a record (closed-loop sends only predictive).
+    series: strategies.map(([s, col]) => ({
+      points: records.flatMap((r, i) => r.replicas[s] === undefined ? [] : [{ x: i, y: r.replicas[s] }]),
+      color: c(col), width: 2,
+    })),
+    markers: replicaMarkers('PREDICTIVE', c('--predictive')),
+  });
+
+  document.getElementById('replicaStats').innerHTML = strategies
+    .filter(([s]) => last.replicas[s] !== undefined)
+    .map(([s, col]) => `<span style="color:${c(col)}">${s} <b>${last.replicas[s]}</b></span>`).join('');
+}
+
+function connect() {
+  const status = document.getElementById('status');
+  const ws = new WebSocket(`ws://${location.host}/ws/dashboard`);
+  ws.onopen = () => { status.textContent = 'live'; status.className = 'status live'; };
+  ws.onclose = () => { status.textContent = 'disconnected — retrying'; status.className = 'status down'; setTimeout(connect, 1500); };
+  ws.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'reset') { records.length = 0; tsIndex.clear(); render(); return; }
+    addRecord(msg); render();
+  };
+}
+
+// Show which mode is running and, in closed-loop, which strategy actually drives
+// real containers (the others are shadow). Mark that line in the replica legend.
+function loadMode() {
+  fetch('/api/mode').then(r => r.json()).then(m => {
+    const badge = document.getElementById('modeBadge');
+    badge.hidden = false;
+    badge.className = 'status mode';
+    if (m.mode === 'closed-loop') {
+      badge.textContent = `closed-loop · driving ${m.drivingStrategy}`;
+      const el = document.querySelector(`.legend span[data-strategy="${m.drivingStrategy}"]`);
+      if (el && !/real/.test(el.textContent)) el.insertAdjacentText('beforeend', ' (real · others shadow)');
+    } else {
+      badge.textContent = 'simulation · all strategies shadow';
+    }
+  }).catch(() => {});
+}
+
+document.getElementById('restart').onclick = () => fetch('/api/reset', { method: 'POST' });
+window.addEventListener('resize', render);
+loadMode();
+connect();
+</script>
+</body>
+</html>

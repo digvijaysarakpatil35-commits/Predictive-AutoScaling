@@ -1,0 +1,49 @@
+# Activated with: --spring.profiles.active=closed-loop
+# Overrides the simulation defaults so the engine drives REAL containers from
+# REAL measured CPU. See docker-compose.closedloop.yml and the README.
+
+autoscale:
+  forecast:
+    # A/B knob: how many intervals ahead predictive forecasts. Longer = bigger
+    # head start on rising edges, but a less accurate forecast on noisy CPU.
+    horizon-intervals: 3
+
+  scaling:
+    # In closed-loop the "load" fed to the engine is L = perReplicaUtilization ×
+    # replicas, so load-per-replica = 1 makes utilization(L, r) = L/r = the
+    # measured per-replica utilization, and thresholds read as utilization
+    # fractions (0.8 = 80% CPU). Mirrors HPA's ceil(replicas × cpu / targetCpu).
+    load-per-replica: 1.0
+    scale-up-threshold: 0.8
+    scale-down-threshold: 0.3
+    target-utilization: 0.6
+    min-replicas: 1
+    max-replicas: 10
+    cooldown-seconds: 60
+
+  docker:
+    enabled: true
+    driving-strategy: PREDICTIVE
+    workload-service: workload
+    compose-file: docker-compose.closedloop.yml
+
+  closed-loop:
+    # where the load generator sends traffic (the nginx LB)
+    lb-url: http://localhost:8090/
+    # seconds of sustained load per interval. Must stay above the docker-stats
+    # sample time (~1s) so the CPU reading isn't taken partly during idle.
+    load-window-millis: 1800
+    # dead time between ticks — keep small; the load window dominates each tick.
+    # Closed-loop is near real-time: real HTTP + docker-stats can't be
+    # fast-forwarded the way the simulation's CSV replay can.
+    tick-delay-millis: 100
+    # scale the trace's demand down to what this machine can serve (calibrate)
+    demand-scale: 1.2
+    # per-replica CPU cap from the compose file; converts docker CPU% -> utilization
+    workload-cpu-limit: 0.5
+    # replicas to seed before the loop starts driving
+    start-replicas: 2
+    # load generator tuning
+    max-concurrency: 64
+    request-timeout-ms: 5000
+    stats-timeout-seconds: 10

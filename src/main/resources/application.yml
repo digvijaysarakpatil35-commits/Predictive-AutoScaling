@@ -1,0 +1,76 @@
+spring:
+  application:
+    name: autoscale-engine
+
+server:
+  port: 8080
+
+logging:
+  file:
+    name: logs/autoscale-engine.log
+
+autoscale:
+  replay:
+    trace-file: traffic-traces/sample-load.csv
+    # logical spacing between snapshots (trace-time). Drives forecast horizon,
+    # cycle position, and cooldown accounting. Must match the 10s spacing baked
+    # into sample-load.csv.
+    interval-seconds: 10
+    # wall-clock delay between emissions. Lower = replay faster than real time
+    # (handy for demos); the trace-time logic above is unaffected.
+    emit-delay-millis: 10000
+
+  ring-buffer:
+    # number of past snapshots retained per service for forecasting
+    capacity: 60
+
+  forecast:
+    # exponential smoothing weight on the latest observation (0-1)
+    exp-smoothing-alpha: 0.4
+    # number of lagged readings fed into the regression forecaster
+    lookback-k: 5
+    # how far ahead (in intervals) each forecaster predicts
+    horizon-intervals: 1
+    # length of the recurring load cycle in intervals; drives the sin/cos
+    # time-of-day features. Matches the synthetic trace's 60-interval cycle.
+    cycle-intervals: 60
+    # ridge regularization on the regression normal equations. Small value
+    # keeps the matrix solvable when features are near-collinear (e.g. flat load).
+    ridge-lambda: 0.0001
+
+  scaling:
+    # requestRate per replica considered "fully loaded"
+    load-per-replica: 50.0
+    # scale up when utilization (load / capacity) exceeds this
+    scale-up-threshold: 0.8
+    # scale down when utilization drops below this
+    scale-down-threshold: 0.3
+    # utilization to size for when we do act; sits inside the [down, up] band
+    # so we don't immediately re-trigger. Drives how many replicas to jump to.
+    target-utilization: 0.6
+    min-replicas: 1
+    max-replicas: 10
+    # seconds to wait after a scaling action before acting again
+    cooldown-seconds: 60
+
+  baseline:
+    fixed-replicas: 4
+
+  metrics:
+    # unloaded response time in ms. Modelled latency = base / (1 - utilization),
+    # so it climbs as load approaches capacity (M/M/1-style) — averages hide this,
+    # which is exactly why we report p95/p99.
+    base-latency-ms: 20.0
+
+  docker:
+    # Real container scaling is OFF by default. The three-way comparison runs
+    # entirely in shadow mode and needs no Docker. Flip to true to actually
+    # drive containers from the chosen strategy's decisions.
+    enabled: false
+    # only this strategy's decisions move real containers
+    driving-strategy: PREDICTIVE
+    # the docker-compose service to scale, and the compose file to use
+    workload-service: workload
+    compose-file: docker-compose.yml
+    # give the docker CLI this long before abandoning a scale command
+    command-timeout-seconds: 60
